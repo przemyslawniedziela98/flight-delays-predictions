@@ -1,0 +1,715 @@
+---
+title: "Prediction of flight delays"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+warnings: no
+---
+<b>Author:</b> Przemyslaw Niedziela (przemyslaw.niedziela98@gmail.com) <br> 
+<b>Date:</b> Jun 2024 <br>
+<br> <br> 
+<b> TL;DR </b> <br>
+This project aimed to predict flight delays. Begins with an EDA to understand the relationships between flight characteristics and delays. Feature engineering provided new features, such as categorical representations of departure times and seasonal indicators. Three ML classification models: Logistic Regression, Random Forest and XGBoost were trained and evaluated.
+<br>
+<br> 
+<b> Conclusion </b> <br>
+The overall performance of the models in predicting flight delays has been promising. All models were performing reasonably. XGBoost achieved highest AUC score of 0.7372, indicating superior ability to distinguish between delayed and non-delayed flights. Logistic Regression is a bit biased towards predicting delays (high sensitivity, low specificity) and Random Forest based towards predicting non-delays (low sensitivity, high specificity). High recall and low specificity in Logistic Regression is suggesting that there might be some overfitting. Possible methods to improve performance are to implement some resampling technique for LR, like SMOTE, add more contextual features (like weather) or to use grid of higher range.  
+<br> 
+<br> 
+<b> source data: </b><br> 
+[Flight Delay and Cancellation Dataset (2019-2023)](https://www.kaggle.com/datasets/patrickzel/flight-delay-and-cancellation-dataset-2019-2023?resource=download) <br> 
+<br>
+
+<b> Legend: </b><br> 
+1.[Reading dataset](#reading-dataset)<br>
+2.[Exploratory analysis](#exploratory-analysis)<br>
+2.1.[General overview analysis](#general-overview-analysis)<br>
+2.2.[Delay analysis](#delay-analysis)<br>
+3.[Feature engineering](#feature-engineering)<br>
+3.1.[Features setup](#features-setup)<br>
+3.2.[Features filtering](#features-filtering)<br>
+3.3.[Features correlations](#features-correlations)<br>
+3.4.[New features analysis](#new-features-analysis)<br>
+3.5.[Features encoding ](#features-encoding)<br>
+4.[Machine Learning classification ](#machine-learning-classification)<br>
+4.1.[Preparing train and test datasets](#preparing-train-and-test-datasets)<br>
+4.2.[Using Logistic Regression](#using-logistic-regression)<br>
+4.3.[Using Random Forest](#using-random-forest)<br>
+4.4.[Using XGBoost](#using-xgboost)<br>
+4.5.[Unseen data predictions](#unseen-data-predictions)<br>
+<br> 
+<br>
+
+```{r setup, include=FALSE} 
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+```
+
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(dplyr)
+library(corrplot)
+library(caret)
+library(glmnet)
+library(pROC)
+library(xgboost)
+library(randomForest)
+```
+
+### Reading dataset
+```{r}
+flight_data <- read.csv("flights_sample_3m.csv")
+```
+
+### Exploratory analysis
+
+#### General overview analysis
+```{r}
+head(flight_data)
+```
+Number of flights per airline 
+```{r}
+flight_counts <- flight_data %>%
+  group_by(AIRLINE_CODE) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count))
+
+flight_counts$AIRLINE_CODE <- factor(flight_counts$AIRLINE_CODE, levels = flight_counts$AIRLINE_CODE)
+
+ggplot(flight_counts, aes(x = AIRLINE_CODE, y = count)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Number of Flights per Airline",
+       x = "Airline Code",
+       y = "Number of Flights") +
+  theme_minimal() 
+```
+
+Volume of flights for cities (origin and destination)
+```{r}
+origin_counts <- flight_data %>%
+  group_by(ORIGIN_CITY) %>%
+  summarise(origin_count = n()) %>%
+  rename(city = ORIGIN_CITY)
+
+destination_counts <- flight_data %>%
+  group_by(DEST_CITY) %>%
+  summarise(destination_count = n()) %>%
+  rename(city = DEST_CITY)
+
+city_counts <- full_join(origin_counts, destination_counts, by = "city") %>%
+  replace_na(list(origin_count = 0, destination_count = 0)) %>%
+  mutate(total_count = origin_count + destination_count)  
+
+top_cities <- city_counts %>%
+  arrange(desc(total_count)) %>%
+  slice_head(n = 20)
+
+top_cities_long <- top_cities %>%
+  pivot_longer(cols = c(origin_count, destination_count),
+               names_to = "flight_type",
+               values_to = "count")
+
+top_cities_long$city <- factor(top_cities_long$city, levels = top_cities$city)
+
+ggplot(top_cities_long, aes(x = city, y = count, fill = flight_type)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Top 20 Cities by Flight Volume",
+       x = "City",
+       y = "Number of Flights",
+       fill = "Flight Type") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) 
+```
+
+Histograms of elapsed time, air time and distance
+```{r}
+hist_columns = c("ELAPSED_TIME", "AIR_TIME", "DISTANCE")
+for (i in seq_along(hist_columns)) {
+  col <- hist_columns[i]
+  p <- ggplot(flight_data, aes_string(x = col)) +
+    geom_histogram(binwidth = c(20, 20, 100)[i], fill = "gray", color = "black") +
+    labs(title = paste("Histogram of", col),
+         x = col,
+         y = "Frequency") +
+    theme_minimal()
+  print(p)
+}
+```
+
+Distance vs. air time and elapsed time
+```{r}
+sampled_data <- flight_data %>% sample_n(500)
+for (col in c("ELAPSED_TIME", "AIR_TIME")) {
+  p <- ggplot(sampled_data, aes_string(x = "DISTANCE", y = col)) +
+    geom_point(alpha = 0.5, color = "grey") +
+    labs(title = paste("Scatter Plot of", col, "vs. Distance"),
+         x = "Distance",
+         y = col) +
+    theme_minimal()
+  
+  print(p)
+}
+```
+
+Delay types deep dive
+```{r}
+delay_type_data <- flight_data %>%
+  select(all_of(c("DELAY_DUE_CARRIER", 
+                  "DELAY_DUE_WEATHER", 
+                  "DELAY_DUE_NAS", 
+                  "DELAY_DUE_SECURITY", 
+                  "DELAY_DUE_LATE_AIRCRAFT"))) %>%
+  pivot_longer(cols = everything(), names_to = "Delay_Type", values_to = "Delay") %>%
+  filter(!is.na(Delay) & Delay > 0)
+
+ggplot(delay_type_data, aes(x = Delay_Type, y = Delay)) +
+  geom_boxplot(fill = "gray", color = "black") +
+  labs(title = "Different Delay Types impact",
+       x = "Delay Type",
+       y = "Logaritmic delay (minutes)") +
+  scale_y_log10() +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+#### Delay analysis
+```{r}
+filtered_flight_data <- flight_data %>%
+  filter(DIVERTED != 1, CANCELLED != 1)
+
+filtered_flight_data <- filtered_flight_data %>%
+  mutate(is_delayed = ARR_DELAY > 0) %>% 
+  filter(!is.na(is_delayed))
+  
+
+delay_summary <- filtered_flight_data %>%
+  summarise(
+    delayed_count = sum(is_delayed),
+    not_delayed_count = n() - sum(is_delayed),
+    delayed_percent = (delayed_count / n()) * 100,
+    not_delayed_percent = (not_delayed_count / n()) * 100
+)
+print(delay_summary)
+```
+
+Delays vs. Airlines
+```{r}
+summary_data <- filtered_flight_data %>%
+  group_by(AIRLINE_CODE) %>%
+  summarise(
+    delayed_count = sum(is_delayed),
+    not_delayed_count = n() - sum(is_delayed)
+  ) %>%
+  mutate(total_flights = delayed_count + not_delayed_count) %>%
+  arrange(desc(total_flights))
+
+summary_data <- summary_data %>%
+  pivot_longer(cols = c(delayed_count, not_delayed_count), names_to = "Status", values_to = "Count")
+
+ggplot(summary_data, aes(x = reorder(AIRLINE_CODE, -total_flights), y = Count, fill = Status)) +
+  geom_col(position = "stack") +
+  labs(title = "Delayed vs Not Delayed Flights by Airline",
+       x = "Airline Code",
+       y = "Number of Flights",
+       fill = "Flight Status") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+```{r}
+summary_data <- filtered_flight_data %>%
+  group_by(AIRLINE_CODE) %>%
+  summarise(
+    delayed_count = sum(is_delayed),
+    total_flights = n(),
+    delayed_percent = (delayed_count / total_flights) * 100
+  ) %>%
+  arrange(desc(delayed_percent))
+
+ggplot(summary_data, aes(x = reorder(AIRLINE_CODE, -delayed_percent), y = delayed_percent)) +
+  geom_bar(stat = "identity", fill = "gray") +
+  geom_text(aes(label = paste0(round(delayed_percent, 1), "%")), vjust = -0.5, color = "black", size = 3) +
+  labs(title = "Percentage of Delayed Flights by Airline",
+       x = "Airline Code",
+       y = "Percentage of Delayed Flights") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Delays vs. origin and destination airport
+```{r}
+origin_summary <- filtered_flight_data %>%
+  group_by(ORIGIN) %>%
+  summarise(
+    delayed_count = sum(is_delayed),
+    total_flights = n(),
+    delayed_percent = (delayed_count / total_flights) * 100
+  ) %>%
+  arrange(desc(delayed_percent)) %>%
+  mutate(Airport_Type = "Origin")
+
+dest_summary <- filtered_flight_data %>%
+  group_by(DEST) %>%
+  summarise(
+    delayed_count = sum(is_delayed),
+    total_flights = n(),
+    delayed_percent = (delayed_count / total_flights) * 100
+  ) %>%
+  arrange(desc(delayed_percent)) %>%
+  mutate(Airport_Type = "Destination")
+
+combined_summary <- bind_rows(
+  origin_summary %>% rename(Airport = ORIGIN),
+  dest_summary %>% rename(Airport = DEST)
+)
+
+top_airports <- combined_summary %>%
+  group_by(Airport) %>%
+  summarise(total_flights = sum(total_flights)) %>%
+  top_n(15, total_flights)
+
+top_combined_summary <- combined_summary %>%
+  filter(Airport %in% top_airports$Airport)
+
+ggplot(top_combined_summary, aes(x = reorder(Airport, -total_flights), y = delayed_percent, fill = Airport_Type)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.7)) +
+  labs(title = "Percentage of Delayed Flights by Airport (Top 20 by Number of Flights)",
+       x = "Airport",
+       y = "Percentage of Delayed Flights",
+       fill = "Airport Type") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Distances based on delay status
+```{r}
+delayed_flights <- subset(filtered_flight_data, is_delayed == TRUE)
+not_delayed_flights <- subset(filtered_flight_data, is_delayed == FALSE)
+  
+combined_flights <- rbind(
+  data.frame(DISTANCE = delayed_flights$DISTANCE, is_delayed = "Delayed"),
+  data.frame(DISTANCE = not_delayed_flights$DISTANCE, is_delayed = "Not Delayed")
+)
+
+ggplot(combined_flights, aes(x = DISTANCE, fill = is_delayed)) +
+  geom_histogram(alpha = 0.6, position = "identity", bins = 30) +
+  scale_fill_manual(values = c("Delayed" = "red", "Not Delayed" = "blue")) +
+  labs(title = "Distribution of Flight Distances by Delay Status",
+       x = "Distance",
+       y = "Frequency",
+       fill = "Delay Status") +
+  theme_minimal()
+```
+
+### Feature engineering
+#### Features setup
+Convert DEP_TIME and ARR_TIME to occasions. 
+```{r}
+convert_to_hour <- function(time) {
+  if (is.na(time) || time == "") return(NA)
+  time <- sprintf("%04d", time) 
+  return(as.numeric(substr(time, 1, 2)))
+}
+
+get_occasion <- function(hour) {
+  if (is.na(hour)) return(NA)
+    case_when(
+    hour >= 5 & hour < 8 ~ "Early Morning",
+    hour >= 8 & hour < 12 ~ "Late Morning",
+    hour >= 12 & hour < 15 ~ "Early Afternoon",
+    hour >= 15 & hour < 18 ~ "Late Afternoon",
+    hour >= 18 & hour < 21 ~ "Evening",
+    TRUE ~ "Night"
+  )
+}
+
+light_filtered_flight_data = filtered_flight_data %>% sample_n(2e5)
+
+light_filtered_flight_data <- light_filtered_flight_data %>%
+  mutate(
+    DEP_TIME_converted = sapply(DEP_TIME, convert_to_hour),
+    ARR_TIME_converted = sapply(ARR_TIME, convert_to_hour),
+    departure_occasion = sapply(DEP_TIME_converted, get_occasion),
+    arrival_occasion = sapply(ARR_TIME_converted, get_occasion)
+  ) %>%
+  select(-DEP_TIME_converted, -ARR_TIME_converted)
+```
+
+Convert FL_DATE into is_weekend and occasions.
+```{r}
+light_filtered_flight_data <- light_filtered_flight_data %>%
+  mutate(FL_DATE = ymd(FL_DATE))
+
+light_filtered_flight_data <- light_filtered_flight_data %>%
+  mutate(is_weekend = wday(FL_DATE) %in% c(1, 7)) 
+
+light_filtered_flight_data <- light_filtered_flight_data %>%
+  mutate(season = case_when(
+    (month(FL_DATE) == 12 & day(FL_DATE) >= 20) | 
+    (month(FL_DATE) == 1 & day(FL_DATE) <= 5) ~ "christmas_new_year",
+    (month(FL_DATE) >= 6 & month(FL_DATE) <= 8) ~ "summer_holidays",
+    TRUE ~ "other"
+  ))
+```
+
+
+#### Features filtering
+Selecting preliminary features based on domain knowledge 
+```{r}
+training_flight_data <- light_filtered_flight_data %>%
+  select(
+      AIRLINE_CODE,
+      ORIGIN, 
+      DEST, 
+      TAXI_IN,
+      TAXI_OUT, 
+      AIR_TIME, 
+      DISTANCE, 
+      is_weekend, 
+      season, 
+      departure_occasion, 
+      arrival_occasion,
+      is_delayed
+)
+```
+
+Checking for missing values
+```{r}
+missing_summary <- training_flight_data %>%
+  summarise_all(~ sum(is.na(.))) %>%
+  gather(key = "column", value = "missing_count") %>%
+  mutate(
+    total_count = nrow(training_flight_data),
+    missing_percent = (missing_count / total_count) * 100
+  ) %>%
+  select(column, missing_count, missing_percent)
+
+print(missing_summary)
+```
+
+Checking for 6-sigma outliers in distance, taxi  times and distance
+```{r}
+calculate_outliers <- function(x) {
+  mu <- mean(x, na.rm = TRUE)
+  sigma <- sd(x, na.rm = TRUE)
+  outliers <- sum(x < (mu - 6 * sigma) | x > (mu + 6 * sigma), na.rm = TRUE)
+  return(outliers)
+}
+
+outliers_summary <- training_flight_data %>%
+  summarise(
+    distance_outliers = calculate_outliers(DISTANCE),
+    air_time_outliers = calculate_outliers(AIR_TIME),
+    taxi_in_outliers = calculate_outliers(TAXI_IN),
+    taxi_out_outliers = calculate_outliers(TAXI_OUT)
+  ) %>%
+  gather(key = "column", value = "outliers_count") %>%
+  mutate(
+    total_count = nrow(training_flight_data),
+    outliers_percent = (outliers_count / total_count) * 100
+  ) %>%
+  select(column, outliers_count, outliers_percent)
+
+print(outliers_summary)
+```
+
+Drop of 6-sigma outliers
+```{r}
+means_sds <- training_flight_data %>%
+  summarise(
+    mean_distance = mean(DISTANCE, na.rm = TRUE),
+    sd_distance = sd(DISTANCE, na.rm = TRUE),
+    mean_taxi_in = mean(TAXI_IN, na.rm = TRUE),
+    sd_taxi_in = sd(TAXI_IN, na.rm = TRUE),
+    mean_taxi_out = mean(TAXI_OUT, na.rm = TRUE),
+    sd_taxi_out = sd(TAXI_OUT, na.rm = TRUE),
+    mean_air_time = mean(AIR_TIME, na.rm = TRUE),
+    sd_air_time = sd(AIR_TIME, na.rm = TRUE)
+  )
+
+is_6sigma_outlier <- function(x, mean, sd) {
+  abs(x - mean) > 6 * sd
+}
+
+training_flight_data <- training_flight_data %>%
+  filter(
+    !is_6sigma_outlier(DISTANCE, means_sds$mean_distance, means_sds$sd_distance) &
+    !is_6sigma_outlier(TAXI_IN, means_sds$mean_taxi_in, means_sds$sd_taxi_in) &
+    !is_6sigma_outlier(TAXI_OUT, means_sds$mean_taxi_out, means_sds$sd_taxi_out) & 
+    !is_6sigma_outlier(AIR_TIME, means_sds$sd_air_time, means_sds$sd_air_time)
+  )
+```
+
+#### Features correlations
+```{r}
+numeric_columns <- select_if(training_flight_data, is.numeric)
+correlation_matrix <- cor(numeric_columns, use = "pairwise.complete.obs")
+corrplot(correlation_matrix, method = "color", type = "upper", 
+         tl.col = "black", tl.srt = 45, diag = FALSE)
+```
+
+#### New features analysis
+```{r}
+features <- c("departure_occasion", "is_weekend", "season", "arrival_occasion")
+plots <- list()
+for (feature in features) {
+  summarised_feature <- training_flight_data %>% 
+      group_by(is_delayed, .data[[feature]]) %>% 
+      summarise(count  = n()) 
+  summarised_feature$is_delayed <- factor(summarised_feature$is_delayed, 
+                                          levels = c(FALSE, TRUE), 
+                                          labels = c("Not Delayed", "Delayed"))
+
+  plot <- ggplot(summarised_feature, aes(x = .data[[feature]], y = count, fill = is_delayed)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    labs(title = paste("Flight Delays by ", feature),
+         x = feature,
+         y = "Count",
+         fill = "Is Delayed") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  plots[[feature]] <- plot
+}
+
+for (feature in features) {
+  print(plots[[feature]])
+}
+```
+
+
+
+#### Features encoding 
+```{r}
+training_flight_data_encoded <- training_flight_data
+columns_to_encode <- c("AIRLINE_CODE", "ORIGIN", "DEST", "is_weekend", 
+                       "season", "departure_occasion", "arrival_occasion")
+
+for (col in columns_to_encode) {
+  training_flight_data_encoded[[col]] <- factor(training_flight_data_encoded[[col]])
+  training_flight_data_encoded[[col]] <- as.numeric(factor(training_flight_data_encoded[[col]]))
+}
+```
+
+
+### Machine Learning classification 
+#### Preparing train and test datasets
+```{r}
+set.seed(123)
+y <- ifelse(training_flight_data_encoded$is_delayed,"True","False")
+X <- training_flight_data_encoded[, !names(training_flight_data_encoded) %in% c("is_delayed")]
+train_indices <- sample(nrow(training_flight_data_encoded), 0.7 * nrow(training_flight_data_encoded))
+X_train <- X[train_indices, ]
+X_test <- X[-train_indices, ]
+y_train <- y[train_indices]
+y_test <- y[-train_indices]
+```
+
+#### Using Logistic Regression
+Cross-validation and the tuning grid
+```{r}
+ctrl <- trainControl(method = "cv",  
+                     number = 10,
+                     summaryFunction = twoClassSummary,
+                     classProbs = TRUE, 
+                     verboseIter = TRUE)
+
+grid <- expand.grid(alpha = 0:1,
+                    lambda = seq(0.001, 0.1, by = 0.001))  
+```
+
+Training
+```{r echo=T, results='hide'}
+set.seed(123)
+logit_model <- train(x = X_train,
+                     y = y_train,
+                     method = "glmnet",
+                     trControl = ctrl,
+                     tuneGrid = grid,
+                     metric = "ROC",
+                     family = "binomial",  
+                     type.measure = "ROC")  
+```
+
+Predictions and performance
+```{r}
+print(logit_model)
+```
+
+Confusion Matrix
+```{r}
+predictions <- predict(logit_model, newdata = X_test)
+y_test <- factor(y_test, levels = levels(predictions))
+confusionMatrix(predictions, y_test)
+```
+
+ROC Curve
+```{r}
+predicted_probs <- predict(logit_model, newdata = X_test, type = "prob")
+roc_curve <- roc(y_test, predicted_probs[,"True"])
+plot(roc_curve, col = "blue", main = "ROC Curve")
+```
+
+
+Features importance analysis
+```{r}
+plot(varImp(logit_model))
+```
+
+#### Using Random Forest
+Cross-validation and the tuning grid
+```{r}
+rf_grid <- expand.grid(
+  mtry = c(2, 3, 4, 5),
+  splitrule = c("gini", "extratrees"),
+  min.node.size = c(1, 5, 10)
+)
+```
+
+Training on subset
+```{r echo=T, results='hide'}
+X_train_subset <- X_train[1:10000, ]
+y_train_subset <- y_train[1:10000]
+
+set.seed(123) 
+rf_model <- train(
+  x = X_train_subset,
+  y = as.factor(y_train_subset),
+  method = "ranger",
+  trControl = ctrl,
+  tuneGrid = rf_grid,
+  metric = "ROC"
+)
+```
+
+Performance
+```{r}
+print(rf_model)
+```
+
+
+Confusion Matrix
+```{r}
+predictions <- predict(rf_model, newdata = X_test)
+probabilities <- predict(rf_model, newdata = X_test, type = "prob")
+
+y_test <- factor(y_test, levels = levels(predictions))
+conf_matrix <- confusionMatrix(predictions, y_test, positive = "True")
+print(conf_matrix)
+```
+
+ROC Curve
+```{r}
+roc_curve <- roc(y_test, probabilities$True)
+plot(roc_curve, main = "ROC Curve for Random Forest Model", col = "blue")
+```
+
+#### Using XGBoost
+Grid for tuning
+```{r echo=T, results='hide'}
+xgb_grid <- expand.grid(
+  nrounds = c(50),
+  max_depth = c(3, 5),
+  eta = c(0.01, 0.1),
+  gamma = c(0, 1),
+  colsample_bytree = c(0.5, 0.7),
+  min_child_weight = c(1, 3),
+  subsample = c(0.7)
+)
+
+set.seed(123) 
+xgb_model <- train(
+  x = as.matrix(X_train_subset),
+  y = as.factor(y_train_subset),
+  method = "xgbTree",
+  trControl = ctrl,
+  tuneGrid = xgb_grid,
+  metric = "ROC"
+)
+```
+
+Performance
+```{r}
+print(xgb_model)
+```
+
+Predictions
+```{r}
+predictions <- predict(xgb_model, newdata = as.matrix(X_test))
+probabilities <- predict(xgb_model, newdata = as.matrix(X_test), type = "prob")
+```
+
+Confusion Matrix
+```{r}
+conf_matrix <- confusionMatrix(predictions, y_test, positive = "True")
+print(conf_matrix)
+```
+
+ROC curve
+```{r}
+roc_curve <- roc(y_test, probabilities$True)
+plot(roc_curve, main = "ROC Curve for XGBoost Model", col = "blue")
+```
+
+AUC calculation
+```{r}
+auc_value <- auc(roc_curve)
+print(auc_value)
+```
+
+Feature importance
+```{r}
+importance <- xgb.importance(feature_names = colnames(X_train), model = xgb_model$finalModel)
+xgb.plot.importance(importance)
+```
+
+
+
+#### Unseen data predictions
+Data preparation
+```{r}
+training_flight_data_copy <- training_flight_data
+columns_to_encode <- c("AIRLINE_CODE", "ORIGIN", "DEST", "is_weekend", 
+                       "season", "departure_occasion", "arrival_occasion")
+
+for (col in columns_to_encode) {
+  training_flight_data_copy[[col]] <- factor(training_flight_data_copy[[col]])
+}
+
+unseen_data <- data.frame(
+  AIRLINE_CODE = factor("AA", levels = levels(training_flight_data_copy$AIRLINE_CODE)),
+  ORIGIN = factor("JFK", levels = levels(training_flight_data_copy$ORIGIN)),
+  DEST = factor("CAE", levels = levels(training_flight_data_copy$DEST)),
+  TAXI_IN = 10,
+  TAXI_OUT = 15,
+  AIR_TIME = 300,
+  DISTANCE = 2500,
+  is_weekend = factor(TRUE, levels = levels(training_flight_data_copy$is_weekend)),
+  season = factor("summer_holidays", levels = levels(training_flight_data_copy$season)),
+  departure_occasion = factor("Late Afternoon", levels = levels(training_flight_data_copy$departure_occasion)),
+  arrival_occasion = factor("Night", levels = levels(training_flight_data_copy$arrival_occasion))
+)
+
+for (col in columns_to_encode) {
+  unseen_data[[col]] <- factor(unseen_data[[col]], levels = levels(training_flight_data_copy[[col]]))
+  unseen_data[[col]] <- as.numeric(factor(unseen_data[[col]]))
+}
+```
+
+
+Prediction Logistic Regression 
+```{r}
+predict(logit_model, newdata = as.matrix(unseen_data), type = "prob")
+```
+
+Prediction Random Forest 
+```{r}
+predict(rf_model, newdata = as.matrix(unseen_data), type = "prob")
+```
+
+Prediction XGBoost
+```{r}
+predict(xgb_model, newdata = as.matrix(unseen_data), type = "prob")
+```
